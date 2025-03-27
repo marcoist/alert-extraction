@@ -2,8 +2,8 @@ import sttp.client3._
 import io.circe.parser._
 import io.circe.generic.auto._
 import org.slf4j.LoggerFactory
-
 import scala.concurrent.duration.{FiniteDuration, SECONDS}
+import scala.util.{Try, Success, Failure}
 
 /** Case class representing a query term */
 case class QueryTerm(id: Int, target: Int, text: String, language: String, keepOrder: Boolean)
@@ -25,17 +25,17 @@ object AlertExtractor {
   private val options = SttpBackendOptions.connectionTimeout(FiniteDuration(30, SECONDS)) // 30 seconds
   implicit val backend: SttpBackend[Identity, Any] = HttpURLConnectionBackend(options)
 
-  // API key and endpoints
-  // API key and URLs could be set in configuration like env var or database entry to be more secure
-  private val apiKey: String = "marco:3c9a661369b9d1f430759ed62f6193779d2f4893c0c0c2757c8983cb2d5f9ef3"
-  private val queryTermsUrl: String = s"https://services.prewave.ai/adminInterface/api/testQueryTerm?key=$apiKey"
-  private val alertsUrl: String = s"https://services.prewave.ai/adminInterface/api/testAlerts?key=$apiKey"
+  // Base URLs - API key will be appended
+  private val queryTermsUrlBase: String = "https://services.prewave.ai/adminInterface/api/testQueryTerm"
+  private val alertsUrlBase: String = "https://services.prewave.ai/adminInterface/api/testAlerts"
 
   /** Fetches query terms from the API and parses to a list of QueryTerm */
-  private def fetchQueryTerms(): List[QueryTerm] = {
-    try {
+  private def fetchQueryTerms(apiKey: String): List[QueryTerm] = {
+    val url = uri"$queryTermsUrlBase?key=$apiKey"
+    logger.debug(s"Fetching query terms from: $queryTermsUrlBase")
+    Try {
       val response = basicRequest
-        .get(uri"$queryTermsUrl")
+        .get(url)
         .response(asString)
         .send(backend)
 
@@ -43,26 +43,33 @@ object AlertExtractor {
 
       response.body match {
         case Right(data) =>
-          val terms = decode[List[QueryTerm]](data).getOrElse(Nil)
-          logger.debug(s"Fetched ${terms.size} query terms")
-          terms
+          decode[List[QueryTerm]](data) match {
+            case Right(terms) =>
+              logger.info(s"Successfully fetched and parsed ${terms.size} query terms.")
+              terms
+            case Left(decodingError) =>
+              logger.error(s"Failed to decode query terms JSON: ${decodingError.getMessage}", decodingError)
+              Nil
+          }
         case Left(error) =>
-          logger.error(s"Error fetching query terms: $error")
+          logger.error(s"Error fetching query terms (HTTP level): $error")
           Nil
       }
-    } catch {
-      case e: Exception =>
-        logger.error(s"Exception when fetching query terms: ${e.getMessage}")
-        e.printStackTrace()
+    } match {
+      case Success(result) => result
+      case Failure(e) =>
+        logger.error(s"Exception occurred when fetching query terms: ${e.getMessage}", e)
         Nil
     }
   }
 
   /** Fetches alerts from the API and parses to a list of Alert */
-  private def fetchAlerts(): List[Alert] = {
-    try {
+  private def fetchAlerts(apiKey: String): List[Alert] = {
+    val url = uri"$alertsUrlBase?key=$apiKey"
+    logger.debug(s"Fetching alerts from: $alertsUrlBase")
+    Try {
       val response = basicRequest
-        .get(uri"$alertsUrl")
+        .get(url)
         .response(asString)
         .send(backend)
 
@@ -70,17 +77,22 @@ object AlertExtractor {
 
       response.body match {
         case Right(data) =>
-          val alerts = decode[List[Alert]](data).getOrElse(Nil)
-          logger.debug(s"Fetched ${alerts.size} alerts")
-          alerts
+          decode[List[Alert]](data) match {
+            case Right(alerts) =>
+              logger.info(s"Successfully fetched and parsed ${alerts.size} alerts.")
+              alerts
+            case Left(decodingError) =>
+              logger.error(s"Failed to decode alerts JSON: ${decodingError.getMessage}", decodingError)
+              Nil
+          }
         case Left(error) =>
-          logger.error(s"Error fetching alerts: $error")
+          logger.error(s"Error fetching alerts (HTTP level): $error")
           Nil
       }
-    } catch {
-      case e: Exception =>
-        logger.error(s"Exception when fetching alerts: ${e.getMessage}")
-        e.printStackTrace()
+    } match {
+      case Success(result) => result
+      case Failure(e) =>
+        logger.error(s"Exception occurred when fetching alerts: ${e.getMessage}", e)
         Nil
     }
   }
@@ -94,12 +106,18 @@ object AlertExtractor {
    */
   def isMatch(queryText: String, alertText: String, keepOrder: Boolean): Boolean = {
     val queryParts = queryText.toLowerCase.split("\\s+").filter(_.nonEmpty)
+    // Note: Basic tokenization using split("\\s+"). This might not robustly handle punctuation
+    // attached to words (e.g., "Metall," vs "Metall"). More advanced tokenization could be used if needed.
     val normalizedAlertText = alertText.toLowerCase()
 
-    if (keepOrder) {
+    if (queryParts.isEmpty) {
+      false
+    } else if (keepOrder) {
+      // Check for the exact sequence of words
       normalizedAlertText.contains(queryParts.mkString(" "))
     } else {
-      // For large texts, this approach can be more efficient
+      // Check if all query parts exist anywhere in the text
+      // Using a Set for alert words offers efficient lookups (O(1) average)
       val alertWords = normalizedAlertText.split("\\s+").toSet
       queryParts.forall(alertWords.contains)
     }
@@ -107,45 +125,74 @@ object AlertExtractor {
 
   /**
    * Find matches between query terms and alerts
-   *
-   * Benefits of this approach:
-   * Early filtering: Reduces the working set at each step
-   * Indexed lookups: Using a map for language-based filtering
-   * Memory efficiency: Avoids creating intermediate collections for non-matches
-   *
-   * Note: For very large datasets, we might also consider using Akka Streams or Futures for Asynchronous Processing
    */
   def findMatches(queryTerms: List[QueryTerm], alerts: List[Alert]): List[Match] = {
-    if (queryTerms.isEmpty || alerts.isEmpty) {
-      logger.error("Failed to fetch data from APIs. Please check your API key.")
+    if (queryTerms.isEmpty) {
+      logger.warn("Query terms list is empty. No matches possible.")
+      return Nil
+    }
+    if (alerts.isEmpty) {
+      logger.warn("Alerts list is empty. No matches possible.")
+      return Nil
     }
 
-    // Pre-group query terms by language for faster lookups
+    // Pre-group query terms by language (case-insensitive) for faster lookups
     val queryTermsByLanguage = queryTerms.groupBy(_.language.toLowerCase)
+    logger.debug(s"Grouped query terms by languages: ${queryTermsByLanguage.keys.mkString(", ")}")
 
-    // Use flatMap for early filtering
     val matches = alerts.flatMap { alert =>
       alert.contents.flatMap { content =>
-        // Only look at query terms matching this content's language
+        // Efficiently get relevant query terms based on content language
         queryTermsByLanguage.getOrElse(content.language.toLowerCase, Nil)
+          // Filter this subset of terms by checking if they match the content text
           .filter(queryTerm => isMatch(queryTerm.text, content.text, queryTerm.keepOrder))
+          // Map successful matches to the Match case class
           .map(queryTerm => Match(alert.id, queryTerm.id))
       }
-    }.distinct
+    }.distinct // Ensure uniqueness as required
 
-    if (matches.nonEmpty) {
-      logger.debug(s"Found ${matches.size} unique matches:")
-      matches.foreach(m => logger.info(s"Alert ID: ${m.alertId}, Query Term ID: ${m.queryTermId}"))
-    }
-
+    logger.info(s"Found ${matches.size} unique matches.")
     matches
   }
 
   /** Main execution function */
   def main(args: Array[String]): Unit = {
-    val queryTerms = fetchQueryTerms()
-    val alerts = fetchAlerts()
+    // --- API Key Handling ---
+    val apiKeyOpt: Option[String] = sys.env.get("PREWAVE_API_KEY")
 
-    findMatches(queryTerms, alerts)
+    apiKeyOpt match {
+      case Some(apiKey) if apiKey.nonEmpty =>
+        logger.info("API Key found in environment variable PREWAVE_API_KEY.")
+
+        // --- Fetch Data ---
+        val queryTerms = fetchQueryTerms(apiKey)
+        val alerts = fetchAlerts(apiKey)
+
+        // --- Process Data ---
+        if (queryTerms.nonEmpty && alerts.nonEmpty) {
+          val foundMatches = findMatches(queryTerms, alerts)
+
+          // --- Output Results ---
+          println("-" * 30)
+          println("Alert Term Extraction Results:")
+          println("-" * 30)
+          if (foundMatches.nonEmpty) {
+            foundMatches.foreach { m =>
+              println(s"Match Found => Alert ID: ${m.alertId}, Query Term ID: ${m.queryTermId}")
+            }
+          } else println("No matches found between the fetched alerts and query terms.")
+
+          println("-" * 30)
+
+        } else logger.error("Could not proceed with matching as fetching query terms or alerts failed or returned empty lists.")
+
+
+      case _ =>
+        logger.error("API Key not found or empty in environment variable PREWAVE_API_KEY.")
+        sys.exit(1)
+    }
+    // Ensure backend is shut down cleanly (especially important for non-daemon thread pools in async backends)
+    backend.close()
+    logger.info("Processing finished.")
   }
 }

@@ -46,7 +46,7 @@ class AlertExtractorSpec extends AnyFlatSpec with Matchers with BeforeAndAfterEa
 
   // Test with empty strings
   it should "handle empty strings correctly" in {
-    AlertExtractor.isMatch("", "Some text", keepOrder = true) shouldBe true  // Empty query matches anything
+    AlertExtractor.isMatch("", "Some text", keepOrder = true) shouldBe false
     AlertExtractor.isMatch("data breach", "", keepOrder = true) shouldBe false  // Non-empty query doesn't match empty text
   }
 
